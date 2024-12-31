@@ -676,8 +676,6 @@ class RecurrentL2T(OnPolicyAlgorithm):
             if self.whole_sequences:
                 actions = actions["teacher"]
                 observations = obs_batch["teacher"]
-            # print("action shape: ", actions.shape)
-            # print("observation shape:", observations.shape)
 
             # teacher is mlp so no funny business
             values, log_prob, entropy = self.compiled_policy.evaluate_actions(
@@ -752,47 +750,42 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 unpad_trajectories(student_action, mask)
             )
 
+            # evaluate actions and get the log prob
+            (
+                student_values,
+                student_log_prob,
+                student_entropy,
+            ) = self.compiled_student_policy.evaluate_actions_whole_sequence(
+                student_observations, actions_batch["student"]
+            )
+
             student_log_prob = BaseBuffer.swap_and_flatten(
                 unpad_trajectories(student_log_prob, mask)
             )
+            # BC loss, maximize the log prob of the teacher action, i.e. minimize the negative student_log_prob
+            student_bc_loss = -th.mean(student_log_prob)
 
-            # student_ratio = th.exp(student_log_prob - old_actions_log_prob_batch)
+            student_ratio = th.exp(student_log_prob - old_actions_log_prob_batch)
 
             # clipped asym loss
-            # student_asym_loss_1 = advantages * student_ratio
-            # student_asym_loss_2 = advantages * th.clamp(
-            #     student_ratio, 1 - clip_range, 1 + clip_range
-            # )
-            # student_asym_loss = -th.min(student_asym_loss_1, student_asym_loss_2).mean()
-            # student_asym_loss = -th.mean(
-            #     advantages * th.clamp(student_ratio, 1 - clip_range, 1 + clip_range)
-            # ).mean()
+            student_asym_loss_1 = advantages * student_ratio
+            student_asym_loss_2 = advantages * th.clamp(
+                student_ratio, 1 - clip_range, 1 + clip_range
+            )
+            student_asym_loss = -th.min(student_asym_loss_1, student_asym_loss_2).mean()
+            student_asym_loss = -th.mean(
+                advantages * th.clamp(student_ratio, 1 - clip_range, 1 + clip_range)
+            ).mean()
+
             teacher_action = actions.detach()
 
-            student_loss = F.mse_loss(
-                student_action, teacher_action
-            )  # + student_asym_loss
+            student_loss = (
+                F.mse_loss(student_action, teacher_action)
+                # + student_asym_loss
+                # student_bc_loss
+            )
 
             student_losses.append(student_loss.item())
-
-            # Calculate approximate form of reverse KL Divergence for early stopping
-            # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
-            # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
-            # and Schulman blog: http://joschu.net/blog/kl-approx.html
-            # with th.no_grad():
-            #     log_ratio = log_prob - old_actions_log_prob_batch
-            #     approx_kl_div = (
-            #         th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
-            #     )
-            #     approx_kl_divs.append(approx_kl_div)
-
-            # if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
-            #     continue_training = False
-            #     if self.verbose >= 1:
-            #         print(
-            #             f"Early stopping at step {self.num_timesteps} due to reaching max kl: {approx_kl_div:.2f}"
-            #         )
-            #     break
 
             # Optimization step
             self.compiled_policy.optimizer.zero_grad()
@@ -819,10 +812,6 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 [self.compiled_policy.optimizer, self.student_policy.optimizer]
             )
 
-        # explained_var = explained_variance(
-        #     self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten()
-        # )
-
         # Logs
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
@@ -841,9 +830,6 @@ class RecurrentL2T(OnPolicyAlgorithm):
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
         self.logger.record("train/student_loss", np.mean(student_losses))
-        # self.logger.record(
-        #     "train/student_policy_loss", statistics.mean(student_policy_losses)
-        # )
 
     def learn(
         self: SelfRecurrentL2T,
@@ -854,14 +840,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
     ) -> SelfRecurrentL2T:
-        # return super().learn(
-        #     total_timesteps=total_timesteps,
-        #     callback=callback,
-        #     log_interval=log_interval,
-        #     tb_log_name=tb_log_name,
-        #     reset_num_timesteps=reset_num_timesteps,
-        #     progress_bar=progress_bar,
-        # )
+
         iteration = 0
 
         total_timesteps, callback = self._setup_learn(
@@ -1119,9 +1098,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         )
         self.logger.record("time/fps", fps)
         self.logger.record("time/iteration_time (s)", iteration_time / 1e9)
-        self.logger.record(
-            "time/collection time per step (s)", locs["collection_time"] / self.n_steps
-        )
+        self.logger.record("time/collection time (s)", locs["collection_time"])
         self.logger.record("time/training_time (s)", locs["training_time"])
         if len(self.rewbuffer) > 1:
             self.logger.record(
